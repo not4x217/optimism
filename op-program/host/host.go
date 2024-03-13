@@ -2,15 +2,19 @@ package host
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 
 	preimage "github.com/ethereum-optimism/optimism/op-preimage"
 	cl "github.com/ethereum-optimism/optimism/op-program/client"
+	"github.com/ethereum-optimism/optimism/op-program/client/l2"
 	"github.com/ethereum-optimism/optimism/op-program/host/config"
 	"github.com/ethereum-optimism/optimism/op-program/host/flags"
 	"github.com/ethereum-optimism/optimism/op-program/host/kvstore"
@@ -110,6 +114,9 @@ func FaultProofProgram(ctx context.Context, logger log.Logger, cfg *config.Confi
 		logger.Debug("Client program completed successfully")
 		return nil
 	} else {
+		go func() {
+			httpServer(logger, ":8090", pHostRW, hHostRW)
+		}()
 		return cl.RunProgram(logger, pClientRW, hClientRW)
 	}
 }
@@ -235,4 +242,54 @@ func launchOracleServer(logger log.Logger, pHostRW io.ReadWriteCloser, getter pr
 		}
 	}()
 	return chErr
+}
+
+func httpServer(logger log.Logger, hostPort string, preimageChannel oppio.FileChannel, hintChannel oppio.FileChannel) {
+	pClient := preimage.NewOracleClient(preimageChannel)
+	hClient := preimage.NewHintWriter(hintChannel)
+
+	http.HandleFunc("/dehash", func(w http.ResponseWriter, req *http.Request) {
+		keyStr := req.URL.Path[len("/dehash/"):]
+		key, err := hex.DecodeString(keyStr)
+		if err != nil {
+			logger.Error("failed to decode key from hex - %s", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		val := pClient.Get(preimage.BlobKey(key[:32]))
+		w.WriteHeader(http.StatusOK)
+		w.Header().Add("Content-type", "application/octet-stream")
+		if _, err = w.Write(val); err != nil {
+			logger.Error("failed to write preimage value to http response - %s", err)
+		}
+	})
+
+	http.HandleFunc("/hint", func(w http.ResponseWriter, req *http.Request) {
+		hintStr := req.URL.Path[len("/hint/"):]
+		hintVal := common.Hash([]byte(hintStr)[common.HashLength:])
+
+		var hint preimage.Hint
+		if strings.Contains(hintStr, l2.HintL2BlockHeader) {
+			hint = l2.BlockHeaderHint(hintVal)
+		} else if strings.Contains(hintStr, l2.HintL2Transactions) {
+			hint = l2.TransactionsHint(hintVal)
+		} else if strings.Contains(hintStr, l2.HintL2Code) {
+			hint = l2.CodeHint(hintVal)
+		} else if strings.Contains(hintStr, l2.HintL2StateNode) {
+			hint = l2.StateNodeHint(hintVal)
+		} else if strings.Contains(hintStr, l2.HintL2Output) {
+			hint = l2.L2OutputHint(hintVal)
+		} else {
+			logger.Error("invalid hint type")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		hClient.Hint(hint)
+		w.WriteHeader(http.StatusOK)
+		w.Header().Add("Content-type", "application/octet-stream")
+		w.Write([]byte("ok"))
+	})
+
+	http.ListenAndServe(hostPort, nil)
 }
